@@ -37,7 +37,7 @@ from time import sleep
 from xmlrpc import client
 from github import Github, GithubObject, InputFileContent
 
-#import github as gh
+import github as gh
 #gh.enable_console_debug_logging()
 
 """
@@ -78,7 +78,7 @@ labelcolor = {
 
 sleep_after_request = 2.0;
 sleep_after_attachment = 60.0;
-sleep_after_10tickets = 0.0;  # TODO maybe this can be reduced due to the longer sleep after attaching something
+sleep_after_10tickets = 0;  # TODO maybe this can be reduced due to the longer sleep after attaching something
 
 config = configparser.ConfigParser(default_config)
 if len(sys.argv) > 1 :
@@ -103,6 +103,9 @@ github_project = config.get('target', 'project_name')
 users_map = ast.literal_eval(config.get('target', 'usernames'))
 must_convert_issues = config.getboolean('issues', 'migrate')
 only_issues = None
+start_issue = 0
+if config.has_option('issues', 'start_issue'):
+    start_issue = int(config.get('issues', 'start_issue'))
 if config.has_option('issues', 'only_issues'):
     only_issues = ast.literal_eval(config.get('issues', 'only_issues'))
 blacklist_issues = None
@@ -113,14 +116,10 @@ if config.has_option('issues', 'filter_issues') :
     filter_issues = config.get('issues', 'filter_issues')
 keywords_to_labels = config.getboolean('issues', 'keywords_to_labels')
 migrate_milestones = config.getboolean('issues', 'migrate_milestones')
+migrate_labels = config.getboolean('issues', 'migrate_labels')
 add_label = None
 if config.has_option('issues', 'add_label'):
     add_label = config.get('issues', 'add_label')
-
-svngit_mapfile = None
-if config.has_option('source', 'svngitmap') :
-    svngit_mapfile = config.get('source', 'svngitmap')
-svngit_map = None
 
 attachment_export = config.getboolean('attachments', 'export')
 if attachment_export :
@@ -133,6 +132,8 @@ must_convert_wiki = config.getboolean('wiki', 'migrate')
 if must_convert_wiki :
     wiki_export_dir = config.get('wiki', 'export_dir')
 
+label_map = ast.literal_eval(config.get('issues', 'label_map'))
+
 #pattern_changeset = r'(?sm)In \[changeset:"([^"/]+?)(?:/[^"]+)?"\]:\n\{\{\{(\n#![^\n]+)?\n(.*?)\n\}\}\}'
 pattern_changeset = r'(?sm)In \[changeset:"[0-9]+" ([0-9]+)\]:\n\{\{\{(\n#![^\n]+)?\n(.*?)\n\}\}\}'
 matcher_changeset = re.compile(pattern_changeset)
@@ -140,33 +141,15 @@ matcher_changeset = re.compile(pattern_changeset)
 pattern_changeset2 = r'\[changeset:([a-zA-Z0-9]+)\]'
 matcher_changeset2 = re.compile(pattern_changeset2)
 
-pattern_svnrev1 = r'(?:\bchangeset *)|(?<=\s)\[([0-9]+)\]'
-matcher_svnrev1 = re.compile(pattern_svnrev1)
 
-pattern_svnrev2 = r'\b(?:changeset *)?r([0-9]+)\b'
-matcher_svnrev2 = re.compile(pattern_svnrev2)
 
 gh_labels = dict()
 gh_user = None
 
 def format_changeset_comment(m):
-    if svngit_map is not None and m.group(1) in svngit_map :
-        r = 'In ' + svngit_map[m.group(1)][0][:10]
-    else :
-        if svngit_map is not None :
-            print ('  WARNING: svn revision', m.group(1), 'not given in svn to git mapping')
-        r = 'In changeset ' + m.group(1)
+    r = 'In changeset ' + m.group(1)
     r += ':\n> ' + m.group(3).replace('\n', '\n> ')
     return r
-
-
-def handle_svnrev_reference(m) :
-    assert svngit_map is not None
-    if m.group(1) in svngit_map :
-        return svngit_map[m.group(1)][0][:10]
-    else :
-        #print '  WARNING: svn revision', m.group(1), 'not given in svn to git mapping'
-        return m.group(0)
 
 
 def trac2markdown(text, base_path, multilines = True) :
@@ -181,10 +164,6 @@ def trac2markdown(text, base_path, multilines = True) :
     text = text.replace('[[BR]]', '\n')
     text = text.replace('[[br]]', '\n')
     text = text.replace("@", "`@`")
-
-    if svngit_map is not None :
-        text = matcher_svnrev1.sub(handle_svnrev_reference, text)
-        text = matcher_svnrev2.sub(handle_svnrev_reference, text)
 
     if multilines:
         text = re.sub(r'^\S[^\n]+([^=-_|])\n([^\s`*0-9#=->-_|])', r'\1 \2', text)
@@ -254,12 +233,16 @@ def gh_create_milestone(dest, milestone_data) :
 
 def gh_ensure_label(dest, labelname, labelcolor) :
     if dest is None : return
+    if labelname in label_map:
+        labelname = label_map[labelname]
     if labelname.lower() in gh_labels :
-        return
-    print ('Create label %s with color #%s' % (labelname, labelcolor));
-    gh_label = dest.create_label(labelname, labelcolor);
-    gh_labels[labelname.lower()] = gh_label;
-    sleep(sleep_after_request)
+        return labelname
+    if labelname and labelcolor :
+        print ('Create label %s with color #%s' % (labelname, labelcolor))
+        gh_label = dest.create_label(labelname, labelcolor)
+        gh_labels[labelname.lower()] = gh_label
+        sleep(sleep_after_request)
+    return labelname
 
 def gh_create_issue(dest, issue_data) :
     if dest is None : return None
@@ -301,7 +284,7 @@ def gh_comment_issue(dest, issue, comment) :
                                            { gistname : filecontent },
                                            'Attachment %s to Ipopt issue #%d created by %s at %s' % (filename, issue.number, comment['author'], comment['created_at']) )
                 note = 'Attachment [%s](%s) by %s created at %s' % (filename, gist.files[gistname].raw_url, comment['author'], comment['created_at'])
-            except UnicodeDecodeError :
+            except (UnicodeDecodeError, AssertionError) :
                 note = 'Binary attachment %s by %s created at %s lost by Trac to GitHub conversion.' % (filename, comment['author'], comment['created_at'])
                 print ('  LOOSING ATTACHMENT', filename, 'in issue', issue.number)
             sleep(sleep_after_attachment)
@@ -349,7 +332,14 @@ def gh_username(dest, origname) :
     assert not origname.startswith('@')
     return origname;
 
-def convert_issues(source, dest, only_issues = None, blacklist_issues = None):
+def map_label(label):
+    if label in label_map:
+        return label_map[label]
+    else:
+        return label
+
+
+def convert_issues(source, dest, only_issues = None, blacklist_issues = None, start_issue = 0):
     milestone_map = {}
 
     if migrate_milestones:
@@ -370,18 +360,19 @@ def convert_issues(source, dest, only_issues = None, blacklist_issues = None):
     for ticket in source.ticket.query(filter_issues):
         get_all_tickets.ticket.get(ticket)
 
-    nextticketid = 1;
+    nextticketid = start_issue;
     ticketcount = 0;
     for src_ticket in get_all_tickets():
         #src_ticket is [id, time_created, time_changed, attributes]
         src_ticket_id = src_ticket[0]
+        if src_ticket_id < start_issue:
+            print("SKIP already finished ticket #%s" % src_ticket_id)
+            continue
         if only_issues and src_ticket_id not in only_issues:
             print("SKIP unwanted ticket #%s" % src_ticket_id)
             continue
         if blacklist_issues and src_ticket_id in blacklist_issues:
             print("SKIP blacklisted ticket #%s" % src_ticket_id)
-            continue
-
         if not only_issues and not blacklist_issues and not config.has_option('issues', 'filter_issues') :
             while nextticketid < src_ticket_id :
                 print("Ticket %d missing in Trac. Generating empty one in GitHub." % nextticketid)
@@ -481,23 +472,25 @@ def convert_issues(source, dest, only_issues = None, blacklist_issues = None):
 
         labels = []
         if add_label:
+            gh_ensure_label(dest, add_label, labelcolor['component'])
             labels.append(add_label)
-        if component is not None and component.strip() != '' :
-            labels.append(component)
-            gh_ensure_label(dest, component, labelcolor['component'])
-        if priority != 'normal' :
-            labels.append(priority)
-            gh_ensure_label(dest, priority, labelcolor['priority'])
-        if severity != 'normal' :
-            labels.append(severity)
-            gh_ensure_label(dest, severity, labelcolor['severity'])
-        if tickettype is not None :
-            labels.append(tickettype)
-            gh_ensure_label(dest, tickettype, labelcolor['type'])
-        if keywords != '' and keywords_to_labels :
-            for keyword in keywords.split(','):
-                labels.append(keyword.strip())
-                gh_ensure_label(dest, keyword.strip(), labelcolor['keyword'])
+        if migrate_labels:
+            if component is not None and component.strip() != '' :
+                component = gh_ensure_label(dest, component, labelcolor['component'])
+                labels.append(component)
+            if priority != 'normal' and priority.strip() != '':
+                priority = gh_ensure_label(dest, priority, labelcolor['priority'])
+                labels.append(priority)
+            if severity != 'normal' and severity.strip() != '':
+                severity = gh_ensure_label(dest, severity, labelcolor['severity'])
+                labels.append(severity)
+            if tickettype is not None and tickettype.strip() != '':
+                tickettype = gh_ensure_label(dest, tickettype, labelcolor['type'])
+                labels.append(tickettype)
+            if keywords != '' and keywords_to_labels :
+                for keyword in keywords.split(','):
+                    keyword = gh_ensure_label(dest, keyword.strip(), labelcolor['keyword'])
+                    labels.append(keyword.strip())
 
         description_pre = 'Issue created by migration from Trac.\n\n'
         description_pre += 'Original creator: ' + reporter + '\n\n'
@@ -550,14 +543,12 @@ def convert_issues(source, dest, only_issues = None, blacklist_issues = None):
         issue = gh_create_issue(dest, issue_data)
 
         # handle status
-        if status in ['new', 'assigned', 'analyzed', 'reopened'] :
-            issue_state = 'open'
-        elif status in ['closed'] :
+        if status in ['closed'] :
             # sometimes a ticket is already closed at creation, so close issue
             issue_state = 'closed'
             gh_update_issue_property(dest, issue, 'state', 'closed')
-        else :
-            raise ValueError("  unknown ticket status: " + status)
+        else:
+            issue_state = 'open'
 
         attachment = None
         for change in changelog:
@@ -595,15 +586,14 @@ def convert_issues(source, dest, only_issues = None, blacklist_issues = None):
                 # we will forget about these old versions and only keep the latest one
                 pass
             elif change_type == "status" :
-                # we map here the various statii we have in trac to just 2 statii in gitlab (open or close), so loose some information
-                if change[4] in ['new', 'assigned', 'analyzed', 'reopened', 'needs_review', 'needs_work', 'positive_review'] :
+                if change[4] in ['closed']:
+                    newstate = 'closed'
+                    gh_comment_issue(dest, issue,
+                                     {'note': 'Changing status from ' + change[3] + ' to ' + change[4] + '.',
+                                      'created_at': change_time, 'author': author})
+                else:
                     newstate = 'open'
                     # should not need an extra comment if closing ticket
-                    gh_comment_issue(dest, issue, {'note' : 'Changing status from ' + change[3] + ' to ' + change[4] + '.', 'created_at' : change_time, 'author' : author})
-                elif change[4] in ['closed'] :
-                    newstate = 'closed'
-                else :
-                    raise ValueError("  unknown ticket status: " + change[4])
 
                 if issue_state != newstate :
                     issue_state = newstate
@@ -621,12 +611,13 @@ def convert_issues(source, dest, only_issues = None, blacklist_issues = None):
                 }
                 gh_comment_issue(dest, issue, note)
             elif change_type == "component" :
-                if change[3] != '' :
-                    labels.remove(change[3])
-                labels.append(change[4])
-                gh_ensure_label(dest, change[4], labelcolor['component'])
+                if migrate_labels:
+                    if change[3] != '' :
+                        labels.remove(map_label(change[3]))
+                    labels.append(map_label(change[4]))
+                    gh_ensure_label(dest, map_label(change[4]), labelcolor['component'])
+                    gh_update_issue_property(dest, issue, 'labels', labels)
                 gh_comment_issue(dest, issue, { 'note' : 'Changing component from ' + change[3] + ' to ' + change[4] + '.', 'created_at' : change_time, 'author' : author })
-                gh_update_issue_property(dest, issue, 'labels', labels)
             elif change_type == "owner" :
                 if change[3] != '' and change[4] != '' :
                     gh_comment_issue(dest, issue, { 'note' : 'Changing assignee from ' + gh_username(dest, change[3]) + ' to ' + gh_username(dest, change[4]) + '.', 'created_at' : change_time, 'author' : author })
@@ -660,14 +651,16 @@ def convert_issues(source, dest, only_issues = None, blacklist_issues = None):
             elif change_type == "cc" :
                 pass  # we handle only the final list of CCs (above)
             elif change_type == "type" :
-                if change[3] != '' :
-                    oldtype = maptickettype(change[3])
-                    labels.remove(oldtype)
-                newtype = maptickettype(change[4])
-                labels.append(newtype)
-                gh_ensure_label(dest, newtype, labelcolor['type'])
-                gh_comment_issue(dest, issue, { 'note' : 'Changing type from ' + change[3] + ' to ' + change[4] + '.', 'created_at' : change_time, 'author' : author })
-                gh_update_issue_property(dest, issue, 'labels', labels)
+                if migrate_labels:
+                    if change[3] != '' :
+                        oldtype = maptickettype(change[3])
+                        labels.remove(oldtype)
+                    newtype = maptickettype(change[4])
+                    labels.append(newtype)
+                    gh_ensure_label(dest, newtype, labelcolor['type'])
+                    gh_update_issue_property(dest, issue, 'labels', labels)
+                gh_comment_issue(dest, issue, {'note': 'Changing type from ' + change[3] + ' to ' + change[4] + '.',
+                                               'created_at': change_time, 'author': author})
             elif change_type == "description" :
                 issue_data['description'] = description_pre + trac2markdown(change[4], '/issues/', False) + '\n\n(changed by ' + author + ' at ' + change_time + ')'
                 gh_update_issue_property(dest, issue, 'description', issue_data['description'])
@@ -675,21 +668,25 @@ def convert_issues(source, dest, only_issues = None, blacklist_issues = None):
                 issue_data['title'] = change[4]
                 gh_update_issue_property(dest, issue, 'title', issue_data['title'])
             elif change_type == "priority" :
-                if change[3] != '' and change[3] != 'normal' :
-                    labels.remove(change[3])
-                if change[4] != '' and change[4] != 'normal' :
-                    labels.append(change[4])
-                    gh_ensure_label(dest, change[4], labelcolor['priority'])
-                    gh_comment_issue(dest, issue, { 'note' : 'Changing priority from ' + change[3] + ' to ' + change[4] + '.', 'created_at' : change_time, 'author' : author })
-                gh_update_issue_property(dest, issue, 'labels', labels)
+                if migrate_labels:
+                    if change[3] != '' and change[3] != 'normal' :
+                        labels.remove(change[3])
+                    if change[4] != '' and change[4] != 'normal' :
+                        labels.append(change[4])
+                        gh_ensure_label(dest, change[4], labelcolor['priority'])
+                    gh_update_issue_property(dest, issue, 'labels', labels)
+                gh_comment_issue(dest, issue, {'note': 'Changing priority from ' + change[3] + ' to ' + change[4] + '.',
+                                               'created_at': change_time, 'author': author})
             elif change_type == "severity" :
-                if change[3] != '' and change[3] != 'normal' :
-                    labels.remove(change[3])
-                if change[4] != '' and change[4] != 'normal' :
-                    labels.append(change[4])
-                    gh_ensure_label(dest, change[4], labelcolor['severity'])
-                    gh_comment_issue(dest, issue, { 'note' : 'Changing severity from ' + change[3] + ' to ' + change[4] + '.', 'created_at' : change_time, 'author' : author })
-                gh_update_issue_property(dest, issue, 'labels', labels)
+                if migrate_labels:
+                    if change[3] != '' and change[3] != 'normal' :
+                        labels.remove(change[3])
+                    if change[4] != '' and change[4] != 'normal' :
+                        labels.append(change[4])
+                        gh_ensure_label(dest, change[4], labelcolor['severity'])
+                    gh_update_issue_property(dest, issue, 'labels', labels)
+                gh_comment_issue(dest, issue, {'note': 'Changing severity from ' + change[3] + ' to ' + change[4] + '.',
+                                               'created_at': change_time, 'author': author})
             elif change_type == "keywords" :
                 if keywords_to_labels :
                     oldkeywords = change[3].split(',')
@@ -709,10 +706,11 @@ def convert_issues(source, dest, only_issues = None, blacklist_issues = None):
                     gh_update_issue_property(dest, issue, 'labels', labels)
                 else :
                     gh_comment_issue(dest, issue, { 'note' : 'Changing keywords from "' + change[3] + '" to "' + change[4] + '".', 'created_at' : change_time, 'author' : author })
-            elif change_type in ["commit",  "upstream",  "stopgaps", "branch", "reviewer", "work_issues", "merged", "dependencies", "author"] :
-                print("TODO Change type: ", change_type)
+            #elif change_type in ["commit",  "upstream",  "stopgaps", "branch", "reviewer", "work_issues", "merged", "dependencies", "author", "series", "build"] :
+            #    print("TODO Change type: ", change_type)
             else :
-                raise BaseException("Unknown change type " + change_type)
+                print("Unknown change type: " + change_type)
+                #raise BaseException("Unknown change type: " + change_type)
         assert attachment is None
 
         ticketcount = ticketcount + 1
@@ -764,6 +762,9 @@ def convert_wiki(source, dest):
 
         # TODO we could use the GitHub API to write into the Wiki repository of the GitHub project
         try :
+            d = os.path.join(wiki_export_dir, pagename)
+            if not os.path.exists(d):
+                os.makedirs(d)
             open(os.path.join(wiki_export_dir, pagename + '.md'), 'w').write(converted)
         except UnicodeEncodeError as e :
             print ('EXCEPTION:', e)
@@ -788,24 +789,8 @@ if __name__ == "__main__":
             gh_labels[l.name.lower()] = l
         #print 'Existing labels:', gh_labels.keys()
 
-    if svngit_mapfile is not None :
-        svngit_map = dict()
-        for line in open(svngit_mapfile, 'r') :
-            l = line.split()
-            if len(l) <= 1 :
-                continue
-            assert len(l) >= 2, line
-            githash = l[0]
-            svnrev = l[1][1:]
-            svnbranch = l[2] if len(l) > 2 else 'trunk'
-            #print l[1], l[0]
-            # if already have a svn revision entry from branch trunk, then ignore others
-            if svnrev in svngit_map and svngit_map[svnrev][1] == 'trunk' :
-                continue
-            svngit_map[svnrev] = [githash, svnbranch]
-
     if must_convert_issues:
-        convert_issues(source, dest, only_issues = only_issues, blacklist_issues = blacklist_issues)
+        convert_issues(source, dest, only_issues = only_issues, blacklist_issues = blacklist_issues, start_issue = start_issue)
 
     if must_convert_wiki:
         convert_wiki(source, dest)
